@@ -548,9 +548,7 @@ void task_lcd(void){
   draw_screen();
   
    char buffer[512];
-   rtc_get_time(RTC,&h,&m,&s);
-   sprintf(buffer,  "%02d:%02d:%02d", h, m, s);
-   font_draw_text(&digital52, buffer, 50, 200, 1);
+   
 
   
    sprintf(buffer,  "%d %", porcento);
@@ -562,7 +560,10 @@ void task_lcd(void){
 	    porcentagem = 100 * value / 4096;
 	    sprintf(buffer,  "%d %", value);
 	    font_draw_text(&digital52, buffer, 40, 250, 1);
-     }     
+     }
+	 rtc_get_time(RTC,&h,&m,&s);
+	 sprintf(buffer,  "%02d:%02d:%02d", h, m, s);
+	 font_draw_text(&digital52, buffer, 50, 200, 1);     
   }	 
 }
 
@@ -592,6 +593,7 @@ int main(void)
 	sysclk_init(); /* Initialize system clocks */
 	board_init();  /* Initialize board */
 	  RTC_init();
+	  config_ADC_TEMP();
 	
 	/* Initialize stdio on USART */
 	stdio_serial_init(USART_SERIAL_EXAMPLE, &usart_serial_options);
