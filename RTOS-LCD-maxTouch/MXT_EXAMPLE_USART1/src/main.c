@@ -93,6 +93,15 @@
 #include "conf_board.h"
 #include "conf_example.h"
 #include "conf_uart_serial.h"
+#include "tfont.h"
+#include "digital521.h"
+
+
+
+#include "soneca.h"
+#include "ar.h"
+#include "termometro.h"
+
 
 /************************************************************************/
 /* LCD + TOUCH                                                          */
@@ -115,12 +124,31 @@ const uint32_t BUTTON_Y = ILI9488_LCD_HEIGHT/2;
 #define TASK_LCD_STACK_SIZE            (2*1024/sizeof(portSTACK_TYPE))
 #define TASK_LCD_STACK_PRIORITY        (tskIDLE_PRIORITY)
 
+#define TASK_AFEC_STACK_SIZE            (2*1024/sizeof(portSTACK_TYPE))
+#define TASK_AFEC_STACK_PRIORITY        (tskIDLE_PRIORITY)
+
+/* Canal do sensor de temperatura */
+#define AFEC_CHANNEL_TEMP_SENSOR 0
+#define MAX_DIGITAL     (4095)
+#define VOLT_REF        (3300)
+
+#define YEAR        2018
+#define MOUNT       3
+#define DAY         19
+#define WEEK        12
+#define HOUR        0
+#define MINUTE      0
+#define SECOND      0
+
 typedef struct {
   uint x;
   uint y;
 } touchData;
 
 QueueHandle_t xQueueTouch;
+QueueHandle_t xQueueAFEC;
+
+volatile Bool  rtc_alarme = false;
 
 /************************************************************************/
 /* RTOS hooks                                                           */
@@ -276,13 +304,125 @@ static void mxt_init(struct mxt_device *device)
 			+ MXT_GEN_COMMANDPROCESSOR_CALIBRATE, 0x01);
 }
 
+void RTC_init(){
+	/* Configura o PMC */
+	pmc_enable_periph_clk(ID_RTC);
+
+	/* Default RTC configuration, 24-hour mode */
+	rtc_set_hour_mode(RTC, 0);
+
+	/* Configura data e hora manualmente */
+	rtc_set_date(RTC, YEAR, MOUNT, DAY, WEEK);
+	rtc_set_time(RTC, HOUR, MINUTE, SECOND);
+
+	/* Configure RTC interrupts */
+	NVIC_DisableIRQ(RTC_IRQn);
+	NVIC_ClearPendingIRQ(RTC_IRQn);
+	NVIC_SetPriority(RTC_IRQn, 0);
+	NVIC_EnableIRQ(RTC_IRQn);
+
+	/* Ativa interrupcao via alarme */
+	rtc_enable_interrupt(RTC,  RTC_IER_SECEN | RTC_IER_ALREN);
+
+}
+
+
+
+/************************************************************************/
+/* Callbacks: / Handler                                                 */
+/************************************************************************/
+
+/**
+ * \brief AFEC interrupt callback function.
+ */
+static void AFEC_Temp_callback(void){
+	uint value = afec_channel_get_value(AFEC0, AFEC_CHANNEL_TEMP_SENSOR);
+	//g_is_conversion_done = true;
+	
+	xQueueSend( xQueueAFEC, &value, 50 / portTICK_PERIOD_MS );
+}
+
+void RTC_Handler(void)
+{
+	uint32_t ul_status = rtc_get_status(RTC);
+
+	/*
+	*  Verifica por qual motivo entrou
+	*  na interrupcao, se foi por segundo
+	*  ou Alarm
+	*/
+	if ((ul_status & RTC_SR_SEC) == RTC_SR_SEC) {
+		rtc_clear_status(RTC, RTC_SCCR_SECCLR);
+		rtc_alarme = 1;
+
+	}
+	
+	/* Time or date alarm */
+	if ((ul_status & RTC_SR_ALARM) == RTC_SR_ALARM) {
+			rtc_clear_status(RTC, RTC_SCCR_ALRCLR);
+	}
+	
+	rtc_clear_status(RTC, RTC_SCCR_ACKCLR);
+	rtc_clear_status(RTC, RTC_SCCR_TIMCLR);
+	rtc_clear_status(RTC, RTC_SCCR_CALCLR);
+	rtc_clear_status(RTC, RTC_SCCR_TDERRCLR);
+}
+
 /************************************************************************/
 /* funcoes                                                              */
 /************************************************************************/
 
+
+static void config_ADC_TEMP(void){
+
+	afec_enable(AFEC0);
+
+	/* struct de configuracao do AFEC */
+	struct afec_config afec_cfg;
+
+	/* Carrega parametros padrao */
+	afec_get_config_defaults(&afec_cfg);
+
+	/* Configura AFEC */
+	afec_init(AFEC0, &afec_cfg);
+
+	/* Configura trigger por software */
+	afec_set_trigger(AFEC0, AFEC_TRIG_TIO_CH_0);
+
+	AFEC0->AFEC_MR |= 3;
+
+	/* configura call back */
+	afec_set_callback(AFEC0, AFEC_INTERRUPT_EOC_11,	AFEC_Temp_callback, 1);
+
+	/*** Configuracao específica do canal AFEC ***/
+	struct afec_ch_config afec_ch_cfg;
+	afec_ch_get_config_defaults(&afec_ch_cfg);
+	afec_ch_cfg.gain = AFEC_GAINVALUE_0;
+	afec_ch_set_config(AFEC0, AFEC_CHANNEL_TEMP_SENSOR, &afec_ch_cfg);
+
+	/*
+	* Calibracao:
+	* Because the internal ADC offset is 0x200, it should cancel it and shift
+	 down to 0.
+	 */
+	afec_channel_set_analog_offset(AFEC0, AFEC_CHANNEL_TEMP_SENSOR, 0x200);
+
+	/***  Configura sensor de temperatura ***/
+	struct afec_temp_sensor_config afec_temp_sensor_cfg;
+
+	afec_temp_sensor_get_config_defaults(&afec_temp_sensor_cfg);
+	afec_temp_sensor_set_config(AFEC0, &afec_temp_sensor_cfg);
+
+	/* Selecina canal e inicializa conversão */
+	afec_channel_enable(AFEC0, AFEC_CHANNEL_TEMP_SENSOR);
+}
+
 void draw_screen(void) {
 	ili9488_set_foreground_color(COLOR_CONVERT(COLOR_WHITE));
 	ili9488_draw_filled_rectangle(0, 0, ILI9488_LCD_WIDTH-1, ILI9488_LCD_HEIGHT-1);
+	ili9488_draw_pixmap(180, 60, soneca.width, soneca.height, soneca.data);
+	ili9488_draw_pixmap(180, 320, ar.width, ar.height, ar.data);
+	ili9488_draw_pixmap(60, 320, termometro.width, termometro.height, termometro.data);
 }
 
 void draw_button(uint32_t clicked) {
@@ -301,6 +441,22 @@ void draw_button(uint32_t clicked) {
 	last_state = clicked;
 }
 
+void font_draw_text(tFont *font, const char *text, int x, int y, int spacing) {
+	char *p = text;
+	while(*p != NULL) {
+		char letter = *p;
+		int letter_offset = letter - font->start_char;
+		if(letter <= font->end_char) {
+			tChar *current_char = font->chars + letter_offset;
+			ili9488_draw_pixmap(x, y, current_char->image->width, current_char->image->height, current_char->image->data);
+			x += current_char->image->width + spacing;
+		}
+		p++;
+	}
+}
+
+
+
 uint32_t convert_axis_system_x(uint32_t touch_y) {
 	// entrada: 4096 - 0 (sistema de coordenadas atual)
 	// saida: 0 - 320
@@ -316,9 +472,9 @@ uint32_t convert_axis_system_y(uint32_t touch_x) {
 void update_screen(uint32_t tx, uint32_t ty) {
 	if(tx >= BUTTON_X-BUTTON_W/2 && tx <= BUTTON_X + BUTTON_W/2) {
 		if(ty >= BUTTON_Y-BUTTON_H/2 && ty <= BUTTON_Y) {
-			draw_button(1);
+			//draw_button(1);
 		} else if(ty > BUTTON_Y && ty < BUTTON_Y + BUTTON_H/2) {
-			draw_button(0);
+			//draw_button(0);
 		}
 	}
 }
@@ -382,18 +538,41 @@ void task_mxt(void){
 
 void task_lcd(void){
   xQueueTouch = xQueueCreate( 10, sizeof( touchData ) );
-	configure_lcd();
+  xQueueAFEC = xQueueCreate( 10, sizeof( uint ) );
+  configure_lcd();
+  uint32_t h,m,s;
+  uint32_t porcento = 100;
+  uint value;
+  uint porcentagem;
   
   draw_screen();
-  draw_button(0);
+  
+   char buffer[512];
+   rtc_get_time(RTC,&h,&m,&s);
+   sprintf(buffer,  "%02d:%02d:%02d", h, m, s);
+   font_draw_text(&digital52, buffer, 50, 200, 1);
+
+  
+   sprintf(buffer,  "%d %", porcento);
+   font_draw_text(&digital52, buffer, 180, 250, 1);
   touchData touch;
     
   while (true) {  
-     if (xQueueReceive( xQueueTouch, &(touch), ( TickType_t )  500 / portTICK_PERIOD_MS)) {
-       update_screen(touch.x, touch.y);
-       printf("x:%d y:%d\n", touch.x, touch.y);
+    if (xQueueReceive( xQueueAFEC, &(value), ( TickType_t )  500 / portTICK_PERIOD_MS)) {
+	    porcentagem = 100 * value / 4096;
+	    sprintf(buffer,  "%d %", value);
+	    font_draw_text(&digital52, buffer, 40, 250, 1);
      }     
   }	 
+}
+
+void task_AFEC(void){
+	while(1){
+		//uint g_blabla = 28;
+		afec_start_software_conversion(AFEC0);
+		vTaskDelay( 4000 / portTICK_PERIOD_MS);
+		//xQueueSend( xQueueAFEC, &g_blabla, 50 / portTICK_PERIOD_MS );
+		}
 }
 
 /************************************************************************/
@@ -412,19 +591,25 @@ int main(void)
 
 	sysclk_init(); /* Initialize system clocks */
 	board_init();  /* Initialize board */
+	  RTC_init();
 	
 	/* Initialize stdio on USART */
 	stdio_serial_init(USART_SERIAL_EXAMPLE, &usart_serial_options);
 		
   /* Create task to handler touch */
   if (xTaskCreate(task_mxt, "mxt", TASK_MXT_STACK_SIZE, NULL, TASK_MXT_STACK_PRIORITY, NULL) != pdPASS) {
-    printf("Failed to create test led task\r\n");
+    printf("Failed to create test mxt task\r\n");
   }
   
   /* Create task to handler LCD */
   if (xTaskCreate(task_lcd, "lcd", TASK_LCD_STACK_SIZE, NULL, TASK_LCD_STACK_PRIORITY, NULL) != pdPASS) {
-    printf("Failed to create test led task\r\n");
+    printf("Failed to create test lcd task\r\n");
   }
+  
+   /* Create task to handler touch */
+   if (xTaskCreate(task_AFEC, "AFEC", TASK_AFEC_STACK_SIZE, NULL, TASK_AFEC_STACK_PRIORITY, NULL) != pdPASS) {
+	    printf("Failed to create test afec task\r\n");
+    }
 
   /* Start the scheduler. */
   vTaskStartScheduler();
