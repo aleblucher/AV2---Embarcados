@@ -118,17 +118,17 @@ const uint32_t BUTTON_Y = ILI9488_LCD_HEIGHT/2;
 /************************************************************************/
 /* RTOS                                                                  */
 /************************************************************************/
-#define TASK_MXT_STACK_SIZE            (2*1024/sizeof(portSTACK_TYPE))
+#define TASK_MXT_STACK_SIZE            (4*1024/sizeof(portSTACK_TYPE))
 #define TASK_MXT_STACK_PRIORITY        (tskIDLE_PRIORITY)  
 
-#define TASK_LCD_STACK_SIZE            (2*1024/sizeof(portSTACK_TYPE))
+#define TASK_LCD_STACK_SIZE            (4*1024/sizeof(portSTACK_TYPE))
 #define TASK_LCD_STACK_PRIORITY        (tskIDLE_PRIORITY)
 
-#define TASK_AFEC_STACK_SIZE            (2*1024/sizeof(portSTACK_TYPE))
+#define TASK_AFEC_STACK_SIZE            (4*1024/sizeof(portSTACK_TYPE))
 #define TASK_AFEC_STACK_PRIORITY        (tskIDLE_PRIORITY)
 
 /* Canal do sensor de temperatura */
-#define AFEC_CHANNEL_TEMP_SENSOR 0
+#define AFEC_CHANNEL_TEMP_SENSOR 11
 #define MAX_DIGITAL     (4095)
 #define VOLT_REF        (3300)
 
@@ -337,9 +337,7 @@ void RTC_init(){
  */
 static void AFEC_Temp_callback(void){
 	uint value = afec_channel_get_value(AFEC0, AFEC_CHANNEL_TEMP_SENSOR);
-	//g_is_conversion_done = true;
-	
-	xQueueSend( xQueueAFEC, &value, 50 / portTICK_PERIOD_MS );
+	xQueueSendFromISR( xQueueAFEC, &value, NULL );
 }
 
 void RTC_Handler(void)
@@ -372,9 +370,11 @@ void RTC_Handler(void)
 /* funcoes                                                              */
 /************************************************************************/
 
-
 static void config_ADC_TEMP(void){
-
+/*************************************
+   * Ativa e configura AFEC
+   *************************************/
+  /* Ativa AFEC - 0 */
 	afec_enable(AFEC0);
 
 	/* struct de configuracao do AFEC */
@@ -387,12 +387,10 @@ static void config_ADC_TEMP(void){
 	afec_init(AFEC0, &afec_cfg);
 
 	/* Configura trigger por software */
-	afec_set_trigger(AFEC0, AFEC_TRIG_TIO_CH_0);
-
-	AFEC0->AFEC_MR |= 3;
+	afec_set_trigger(AFEC0, AFEC_TRIG_SW);
 
 	/* configura call back */
-	afec_set_callback(AFEC0, AFEC_INTERRUPT_EOC_11,	AFEC_Temp_callback, 1);
+	afec_set_callback(AFEC0, AFEC_INTERRUPT_EOC_11,	AFEC_Temp_callback, 5);
 
 	/*** Configuracao específica do canal AFEC ***/
 	struct afec_ch_config afec_ch_cfg;
@@ -538,7 +536,6 @@ void task_mxt(void){
 
 void task_lcd(void){
   xQueueTouch = xQueueCreate( 10, sizeof( touchData ) );
-  xQueueAFEC = xQueueCreate( 10, sizeof( uint ) );
   configure_lcd();
   uint32_t h,m,s;
   uint32_t porcento = 100;
@@ -549,8 +546,6 @@ void task_lcd(void){
   
    char buffer[512];
    
-
-  
    sprintf(buffer,  "%d %", porcento);
    font_draw_text(&digital52, buffer, 180, 250, 1);
   touchData touch;
@@ -558,8 +553,10 @@ void task_lcd(void){
   while (true) {  
     if (xQueueReceive( xQueueAFEC, &(value), ( TickType_t )  500 / portTICK_PERIOD_MS)) {
 	    porcentagem = 100 * value / 4096;
-	    sprintf(buffer,  "%d %", value);
+	    sprintf(buffer,  "%d %", porcentagem);
 	    font_draw_text(&digital52, buffer, 40, 250, 1);
+		printf("%d \n", value);
+
      }
 	 rtc_get_time(RTC,&h,&m,&s);
 	 sprintf(buffer,  "%02d:%02d:%02d", h, m, s);
@@ -568,8 +565,12 @@ void task_lcd(void){
 }
 
 void task_AFEC(void){
+	xQueueAFEC = xQueueCreate( 10, sizeof( uint ) );
+    config_ADC_TEMP();
+
 	while(1){
 		//uint g_blabla = 28;
+		printf("start \n");
 		afec_start_software_conversion(AFEC0);
 		vTaskDelay( 4000 / portTICK_PERIOD_MS);
 		//xQueueSend( xQueueAFEC, &g_blabla, 50 / portTICK_PERIOD_MS );
@@ -593,7 +594,6 @@ int main(void)
 	sysclk_init(); /* Initialize system clocks */
 	board_init();  /* Initialize board */
 	  RTC_init();
-	  config_ADC_TEMP();
 	
 	/* Initialize stdio on USART */
 	stdio_serial_init(USART_SERIAL_EXAMPLE, &usart_serial_options);
