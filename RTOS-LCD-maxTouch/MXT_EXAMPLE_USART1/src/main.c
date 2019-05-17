@@ -128,16 +128,16 @@ const uint32_t BUTTON_Y = ILI9488_LCD_HEIGHT/2;
 #define TASK_AFEC_STACK_PRIORITY        (tskIDLE_PRIORITY)
 
 /* Canal do sensor de temperatura */
-#define AFEC_CHANNEL_TEMP_SENSOR 11
+#define AFEC_CHANNEL_TEMP_SENSOR 0
 #define MAX_DIGITAL     (4095)
 #define VOLT_REF        (3300)
 
-#define YEAR        2018
-#define MOUNT       3
-#define DAY         19
+#define YEAR        2019
+#define MOUNT       5
+#define DAY         17
 #define WEEK        12
-#define HOUR        0
-#define MINUTE      0
+#define HOUR        15
+#define MINUTE      35
 #define SECOND      0
 
 typedef struct {
@@ -147,8 +147,46 @@ typedef struct {
 
 QueueHandle_t xQueueTouch;
 QueueHandle_t xQueueAFEC;
+SemaphoreHandle_t xSemaphore;
 
 volatile Bool  rtc_alarme = false;
+
+
+/************************************************************************/
+/*  PWM                                                                 */
+/************************************************************************/
+
+#define ELED1_PIO           PIOA                  // periferico que controla o LED
+#define ELED1_PIO_ID        10                    // ID do periférico PIOC (controla LED)
+#define ELED1_PIO_IDX		0u                    // ID do LED no PIO
+#define ELED1_PIO_IDX_MASK  (1u << ELED1_PIO_IDX)   // Mascara para CONTROLARMOS o LED ;; 7 PA0
+
+
+#define EBUT1_PIO			PIOD 
+#define EBUT1_PIO_ID		ID_PIOD
+#define EBUT1_PIO_IDX		28
+#define EBUT1_PIO_IDX_MASK (1u << EBUT1_PIO_IDX)
+
+#define EBUT2_PIO			PIOC
+#define EBUT2_PIO_ID		ID_PIOC
+#define EBUT2_PIO_IDX		31
+#define EBUT2_PIO_IDX_MASK (1u << EBUT2_PIO_IDX)
+
+
+#define PIO_PWM_0 PIOA
+#define ID_PIO_PWM_0 ID_PIOA
+#define MASK_PIN_PWM_0 (1 << 0)
+
+/** PWM frequency in Hz */
+#define PWM_FREQUENCY      1000
+/** Period value of PWM output waveform */
+#define PERIOD_VALUE       100
+/** Initial duty cycle value */
+#define INIT_DUTY_VALUE    0
+
+/** PWM channel instance for LEDs */
+pwm_channel_t g_pwm_channel_led;
+volatile uint duty = 0;
 
 /************************************************************************/
 /* RTOS hooks                                                           */
@@ -173,7 +211,7 @@ extern void vApplicationStackOverflowHook(xTaskHandle *pxTask,
  */
 extern void vApplicationIdleHook(void)
 {
-	pmc_sleep(SAM_PM_SMODE_SLEEP_WFI);
+	//pmc_sleep(SAM_PM_SMODE_SLEEP_WFI);
 }
 
 /**
@@ -318,13 +356,48 @@ void RTC_init(){
 	/* Configure RTC interrupts */
 	NVIC_DisableIRQ(RTC_IRQn);
 	NVIC_ClearPendingIRQ(RTC_IRQn);
-	NVIC_SetPriority(RTC_IRQn, 0);
+	NVIC_SetPriority(RTC_IRQn, 5);
 	NVIC_EnableIRQ(RTC_IRQn);
 
 	/* Ativa interrupcao via alarme */
 	rtc_enable_interrupt(RTC,  RTC_IER_SECEN | RTC_IER_ALREN);
 
 }
+
+void PWM0_init(uint channel, uint duty){
+	/* Enable PWM peripheral clock */
+	pmc_enable_periph_clk(ID_PWM0);
+
+	/* Disable PWM channels for LEDs */
+	pwm_channel_disable(PWM0, PIN_PWM_LED0_CHANNEL);
+
+	/* Set PWM clock A as PWM_FREQUENCY*PERIOD_VALUE (clock B is not used) */
+	pwm_clock_t clock_setting = {
+		.ul_clka = PWM_FREQUENCY * PERIOD_VALUE,
+		.ul_clkb = 0,
+		.ul_mck = sysclk_get_peripheral_hz()
+	};
+	
+	pwm_init(PWM0, &clock_setting);
+
+	/* Initialize PWM channel for LED0 */
+	/* Period is left-aligned */
+	g_pwm_channel_led.alignment = PWM_ALIGN_CENTER;
+	/* Output waveform starts at a low level */
+	g_pwm_channel_led.polarity = PWM_HIGH;
+	/* Use PWM clock A as source clock */
+	g_pwm_channel_led.ul_prescaler = PWM_CMR_CPRE_CLKA;
+	/* Period value of output waveform */
+	g_pwm_channel_led.ul_period = PERIOD_VALUE;
+	/* Duty cycle value of output waveform */
+	g_pwm_channel_led.ul_duty = duty;
+	g_pwm_channel_led.channel = channel;
+	pwm_channel_init(PWM0, &g_pwm_channel_led);
+	
+	/* Enable PWM channels for LEDs */
+	pwm_channel_enable(PWM0, channel);
+}
+
 
 
 
@@ -340,6 +413,19 @@ static void AFEC_Temp_callback(void){
 	xQueueSendFromISR( xQueueAFEC, &value, NULL );
 }
 
+static void but1_callback(){
+	duty += 10;
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	xSemaphoreGiveFromISR(xSemaphore, &xHigherPriorityTaskWoken);
+	
+}
+
+static void but2_callback(){
+	duty -= 10;
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	xSemaphoreGiveFromISR(xSemaphore, &xHigherPriorityTaskWoken);
+	
+}
 void RTC_Handler(void)
 {
 	uint32_t ul_status = rtc_get_status(RTC);
@@ -366,6 +452,28 @@ void RTC_Handler(void)
 	rtc_clear_status(RTC, RTC_SCCR_TDERRCLR);
 }
 
+void BUT_init(void){
+	/* config. pino botao em modo de entrada */
+	pmc_enable_periph_clk(EBUT1_PIO_ID);
+	pmc_enable_periph_clk(EBUT2_PIO_ID);
+	
+	pio_set_input(EBUT1_PIO, EBUT1_PIO_IDX_MASK, PIO_PULLUP | PIO_DEBOUNCE);
+	pio_set_input(EBUT2_PIO, EBUT2_PIO_IDX_MASK, PIO_PULLUP | PIO_DEBOUNCE);
+	
+	pio_handler_set(EBUT1_PIO, EBUT1_PIO_ID, EBUT1_PIO_IDX_MASK, PIO_IT_FALL_EDGE, but1_callback);
+	pio_handler_set(EBUT2_PIO, EBUT2_PIO_ID, EBUT2_PIO_IDX_MASK, PIO_IT_FALL_EDGE, but2_callback);
+
+	NVIC_EnableIRQ(EBUT1_PIO_ID);
+	NVIC_EnableIRQ(EBUT2_PIO_ID);
+	
+	NVIC_SetPriority(EBUT1_PIO_ID, 5);
+	NVIC_SetPriority(EBUT2_PIO_ID, 5);
+	
+	pio_enable_interrupt(EBUT1_PIO, EBUT1_PIO_IDX_MASK);
+	pio_enable_interrupt(EBUT2_PIO, EBUT2_PIO_IDX_MASK);
+}
+
+
 /************************************************************************/
 /* funcoes                                                              */
 /************************************************************************/
@@ -390,7 +498,7 @@ static void config_ADC_TEMP(void){
 	afec_set_trigger(AFEC0, AFEC_TRIG_SW);
 
 	/* configura call back */
-	afec_set_callback(AFEC0, AFEC_INTERRUPT_EOC_11,	AFEC_Temp_callback, 5);
+	afec_set_callback(AFEC0, AFEC_INTERRUPT_EOC_0,	AFEC_Temp_callback, 5);
 
 	/*** Configuracao específica do canal AFEC ***/
 	struct afec_ch_config afec_ch_cfg;
@@ -423,22 +531,6 @@ void draw_screen(void) {
 	ili9488_draw_pixmap(60, 320, termometro.width, termometro.height, termometro.data);
 }
 
-void draw_button(uint32_t clicked) {
-	static uint32_t last_state = 255; // undefined
-	if(clicked == last_state) return;
-	
-	ili9488_set_foreground_color(COLOR_CONVERT(COLOR_BLACK));
-	ili9488_draw_filled_rectangle(BUTTON_X-BUTTON_W/2, BUTTON_Y-BUTTON_H/2, BUTTON_X+BUTTON_W/2, BUTTON_Y+BUTTON_H/2);
-	if(clicked) {
-		ili9488_set_foreground_color(COLOR_CONVERT(COLOR_TOMATO));
-		ili9488_draw_filled_rectangle(BUTTON_X-BUTTON_W/2+BUTTON_BORDER, BUTTON_Y+BUTTON_BORDER, BUTTON_X+BUTTON_W/2-BUTTON_BORDER, BUTTON_Y+BUTTON_H/2-BUTTON_BORDER);
-	} else {
-		ili9488_set_foreground_color(COLOR_CONVERT(COLOR_GREEN));
-		ili9488_draw_filled_rectangle(BUTTON_X-BUTTON_W/2+BUTTON_BORDER, BUTTON_Y-BUTTON_H/2+BUTTON_BORDER, BUTTON_X+BUTTON_W/2-BUTTON_BORDER, BUTTON_Y-BUTTON_BORDER);
-	}
-	last_state = clicked;
-}
-
 void font_draw_text(tFont *font, const char *text, int x, int y, int spacing) {
 	char *p = text;
 	while(*p != NULL) {
@@ -453,8 +545,6 @@ void font_draw_text(tFont *font, const char *text, int x, int y, int spacing) {
 	}
 }
 
-
-
 uint32_t convert_axis_system_x(uint32_t touch_y) {
 	// entrada: 4096 - 0 (sistema de coordenadas atual)
 	// saida: 0 - 320
@@ -465,16 +555,6 @@ uint32_t convert_axis_system_y(uint32_t touch_x) {
 	// entrada: 0 - 4096 (sistema de coordenadas atual)
 	// saida: 0 - 320
 	return ILI9488_LCD_HEIGHT*touch_x/4096;
-}
-
-void update_screen(uint32_t tx, uint32_t ty) {
-	if(tx >= BUTTON_X-BUTTON_W/2 && tx <= BUTTON_X + BUTTON_W/2) {
-		if(ty >= BUTTON_Y-BUTTON_H/2 && ty <= BUTTON_Y) {
-			//draw_button(1);
-		} else if(ty > BUTTON_Y && ty < BUTTON_Y + BUTTON_H/2) {
-			//draw_button(0);
-		}
-	}
 }
 
 void mxt_handler(struct mxt_device *device, uint *x, uint *y)
@@ -534,33 +614,74 @@ void task_mxt(void){
 	}
 }
 
-void task_lcd(void){
+void task_lcd(void){ 
   xQueueTouch = xQueueCreate( 10, sizeof( touchData ) );
+  xSemaphore = xSemaphoreCreateBinary();
   configure_lcd();
   uint32_t h,m,s;
   uint32_t porcento = 100;
   uint value;
-  uint porcentagem;
+  uint temp;
+  duty = 0;
   
   draw_screen();
   
-   char buffer[512];
+  BUT_init();
+   pmc_enable_periph_clk(ID_PIO_PWM_0);
+   pio_set_peripheral(PIO_PWM_0, PIO_PERIPH_A, MASK_PIN_PWM_0 );
+   PWM0_init(0, duty);
+  
+   char buffer[5];
    
-   sprintf(buffer,  "%d %", porcento);
-   font_draw_text(&digital52, buffer, 180, 250, 1);
+   	if (xSemaphore == NULL)
+   	printf("Falha em criar semaforo \n");
+
   touchData touch;
+  
+  char buffert_temp[5];
+  char buffert_pwm[5];
     
   while (true) {  
     if (xQueueReceive( xQueueAFEC, &(value), ( TickType_t )  500 / portTICK_PERIOD_MS)) {
-	    porcentagem = 100 * value / 4096;
-	    sprintf(buffer,  "%d %", porcentagem);
+	    temp = 100 * value / 4096;
+	    sprintf(buffer,  "%d C", temp);
 	    font_draw_text(&digital52, buffer, 40, 250, 1);
-		printf("%d \n", value);
+		//printf("%d \n", value);
 
      }
+	 if(xSemaphoreTake(xSemaphore, ( TickType_t ) 100) == pdTRUE ){
+		 
+		 if (duty >= 100){
+			 duty = 100;
+			 
+		 }
+		 if (duty <= 0){
+			 duty = 0;
+		 }
+		 if (duty <= 30){
+				ili9488_set_foreground_color(COLOR_CONVERT(COLOR_GREEN));
+				ili9488_draw_filled_rectangle(150, 400, 300, 430);
+		 }
+		 else if(duty > 30 & duty <= 70){
+			 ili9488_set_foreground_color(COLOR_CONVERT(COLOR_YELLOW));
+			 ili9488_draw_filled_rectangle(150, 400, 300, 430);
+		 }
+		 else{
+			 ili9488_set_foreground_color(COLOR_CONVERT(COLOR_RED));
+			 ili9488_draw_filled_rectangle(150, 400, 300, 430);
+		 }
+		 
+		 printf("%d \t", duty);
+		 pwm_channel_update_duty(PWM0, &g_pwm_channel_led, 100 - duty);
+		
+		sprintf(buffert_pwm, "%4d", duty);
+		 font_draw_text(&digital52, buffert_pwm, 180, 250, 1);
+		 
+	 }
 	 rtc_get_time(RTC,&h,&m,&s);
+	 
 	 sprintf(buffer,  "%02d:%02d:%02d", h, m, s);
-	 font_draw_text(&digital52, buffer, 50, 200, 1);     
+	 font_draw_text(&digital52, buffer, 50, 165, 1);     
   }	 
 }
 
@@ -569,11 +690,8 @@ void task_AFEC(void){
     config_ADC_TEMP();
 
 	while(1){
-		//uint g_blabla = 28;
-		printf("start \n");
 		afec_start_software_conversion(AFEC0);
 		vTaskDelay( 4000 / portTICK_PERIOD_MS);
-		//xQueueSend( xQueueAFEC, &g_blabla, 50 / portTICK_PERIOD_MS );
 		}
 }
 
@@ -593,11 +711,11 @@ int main(void)
 
 	sysclk_init(); /* Initialize system clocks */
 	board_init();  /* Initialize board */
-	  RTC_init();
-	
+	 RTC_init();
+	 
 	/* Initialize stdio on USART */
 	stdio_serial_init(USART_SERIAL_EXAMPLE, &usart_serial_options);
-		
+	
   /* Create task to handler touch */
   if (xTaskCreate(task_mxt, "mxt", TASK_MXT_STACK_SIZE, NULL, TASK_MXT_STACK_PRIORITY, NULL) != pdPASS) {
     printf("Failed to create test mxt task\r\n");
